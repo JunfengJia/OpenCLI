@@ -83,6 +83,19 @@ function evaluateProfileProbe(html, expectedName = 'Jane Doe', { withText = fals
     return dom.window.eval(buildProfileProbeScript(expectedName));
 }
 
+describe('linkedin profile probe: the 1st-degree badge', () => {
+    // 2026-10-06: "Brittany Pollard She/Her · 1st" read as not connected, because the badge check
+    // expected the dot right after the name.
+    const page = (afterName) => `<main><section class="pv-top-card"><h1>Jane Doe</h1><span>${afterName}</span>
+        <button aria-label="Message">Message</button><button aria-label="More">More</button></section></main>`;
+    it('reads the badge after the name, with or without pronouns', () => {
+        expect(evaluateProfileProbe(page(' · 1st'), 'Jane Doe', { withText: true }).alreadyConnected).toBe(true);
+        expect(evaluateProfileProbe(page(' She/Her · 1st'), 'Jane Doe', { withText: true }).alreadyConnected).toBe(true);
+        expect(evaluateProfileProbe(page(' He/Him · 2nd'), 'Jane Doe', { withText: true }).alreadyConnected).toBe(false);
+        expect(evaluateProfileProbe(page(' Someone else · 1st'), 'Jane Doe', { withText: true }).alreadyConnected).toBe(false);
+    });
+});
+
 describe('linkedin connect helpers', () => {
     it('normalizes names and profile URLs', () => {
         expect(normalizeName('Jane Doe • 2nd degree connection')).toBe('jane doe');

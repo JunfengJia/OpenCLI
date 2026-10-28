@@ -276,7 +276,9 @@ function buildProfileProbeScript(expectedName = '') {
     const mainRaw = clean(main?.innerText || '');
     const nameAt = name ? mainRaw.indexOf(name) : -1;
     const afterName = nameAt >= 0 ? mainRaw.slice(nameAt + name.length, nameAt + name.length + 24) : '';
-    const firstDegreeBadge = /\b1st degree connection\b/i.test(topCardRaw) || /^\s*[·•]\s*1st\b/.test(afterName);
+    // Pronouns sit between the name and the badge when the owner set them ("Jane Doe She/Her · 1st",
+    // measured 2026-10-06), so allow one short "x/y" word before the dot.
+    const firstDegreeBadge = /\b1st degree connection\b/i.test(topCardRaw) || /^\s*(?:[\p{L}]{1,8}\/[\p{L}]{1,8}\s*)?[·•]\s*1st\b/u.test(afterName);
     const alreadyConnected = !connectAvailable && firstDegreeBadge;
     // The Connect control is an <a> linking to LinkedIn's invitation route
     // (/preload/custom-invite/?vanityName=...). Capture it so the sender can
@@ -673,4 +675,16 @@ export const __test__ = {
     buildProfileProbeScript,
     buildOpenConnectDialogScript,
     buildSentInvitationsProbeScript,
+};
+
+// Shared with linkedin message (message.js): one profile probe and one owner resolution, so the
+// message path verifies a profile exactly the way connect does.
+export const __profile__ = {
+    OWNER_NAME_JS,
+    OWNER_SCOPE_JS,
+    buildProfileProbeScript,
+    assessProfileSafety,
+    canonicalizeLinkedInProfileUrl,
+    requireLinkedInProfileUrl,
+    normalizeName,
 };
