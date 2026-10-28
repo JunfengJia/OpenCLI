@@ -6,12 +6,17 @@
  */
 
 declare const __OPENCLI_COMPAT_RANGE__: string;
+// Content hash of this built background.js, stamped by the vite build (the same
+// value lands in dist/build-id.txt). Lets the CLI tell whether the code a browser
+// is running is the code on disk.
+declare const __OPENCLI_BUILD_ID__: string;
 
 import { callChrome, describeChrome, ChromeApiError } from './chrome-api';
 import type { Command, Result } from './protocol';
 import { DAEMON_HOST, DAEMON_PORT, DAEMON_WS_URL, DAEMON_PING_URL } from './protocol';
 import { findIdleInteractiveGroup, idlePlaceholderUrl, parkIdleInteractiveTab, consumeIdlePlaceholder } from './idle-container';
 import * as executor from './cdp';
+import * as visual from './visual';
 import * as identity from './identity';
 import { executeWithJournal } from './journal';
 
@@ -1352,6 +1357,14 @@ async function handleCommand(cmd: Command): Promise<Result> {
       return errorResult(cmd.id, err);
     }
   }
+  if (cmd.action === 'extension-info') return handleExtensionInfo(cmd);
+  if (cmd.action === 'reload-extension') {
+    try {
+      return await handleReloadExtension(cmd);
+    } catch (err) {
+      return errorResult(cmd.id, err);
+    }
+  }
   const session = getSessionName(cmd.session);
   const surface = getCommandSurface(cmd);
   const leaseKey = getLeaseKey(session, surface);
@@ -1386,6 +1399,8 @@ async function handleCommand(cmd: Command): Promise<Result> {
         return await handleCookies(cmd);
       case 'screenshot':
         return await handleScreenshot(cmd, leaseKey);
+      case 'visual':
+        return await handleVisual(cmd, leaseKey);
       case 'close-owned-tab':
       case 'close-window':
         return await handleCloseWindow(cmd, leaseKey);
@@ -1528,8 +1543,29 @@ type ResolvedTab = { tabId: number; tab: chrome.tabs.Tab | null };
  * Resolve target tab for the session lease, returning both the tabId and
  * the Tab object (when available) so callers can skip a redundant chrome.tabs.get().
  */
-async function resolveTab(tabId: number | undefined, leaseKey: string, initialUrl?: string): Promise<ResolvedTab> {
+async function resolveTab(tabId: number | undefined, leaseKey: string, initialUrl?: string, strictExplicit = false): Promise<ResolvedTab> {
   const existingSession = automationSessions.get(leaseKey);
+  if (strictExplicit) {
+    if (tabId === undefined) throw new CommandFailure('target_tab_gone', 'The requested tab no longer exists.');
+    let tab: chrome.tabs.Tab;
+    try {
+      tab = await chrome.tabs.get(tabId);
+    } catch {
+      throw new CommandFailure('target_tab_gone', 'The requested tab no longer exists.');
+    }
+    if (!isDebuggableUrl(tab.url)) {
+      throw new CommandFailure('target_tab_not_debuggable', `The requested tab is not debuggable (${tab.url ?? 'unknown URL'}).`);
+    }
+    const matchesSession = existingSession
+      ? (existingSession.preferredTabId !== null
+        ? existingSession.preferredTabId === tabId
+        : tab.windowId === existingSession.windowId)
+      : false;
+    if (!matchesSession) {
+      throw new CommandFailure('target_tab_mismatch', 'The requested tab is outside this browser session.');
+    }
+    return { tabId, tab };
+  }
   // Even when an explicit tabId is provided, validate it is still debuggable.
   if (tabId !== undefined) {
     try {
@@ -1650,8 +1686,8 @@ async function pageScopedResult(id: string, tabId: number, data?: unknown): Prom
 }
 
 /** Convenience wrapper returning just the tabId (used by most handlers) */
-async function resolveTabId(tabId: number | undefined, leaseKey: string, initialUrl?: string): Promise<number> {
-  const resolved = await resolveTab(tabId, leaseKey, initialUrl);
+async function resolveTabId(tabId: number | undefined, leaseKey: string, initialUrl?: string, strictExplicit = false): Promise<number> {
+  const resolved = await resolveTab(tabId, leaseKey, initialUrl, strictExplicit);
   return resolved.tabId;
 }
 
@@ -1728,7 +1764,7 @@ function errorResult(id: string, err: unknown): Result {
 async function handleExec(cmd: Command, leaseKey: string): Promise<Result> {
   if (!cmd.code) return { id: cmd.id, ok: false, error: 'Missing code' };
   const cmdTabId = await resolveCommandTabId(cmd);
-  const tabId = await resolveTabId(cmdTabId, leaseKey);
+  const tabId = await resolveTabId(cmdTabId, leaseKey, undefined, Boolean(cmd.page));
   try {
     const aggressive = getSurfaceFromKey(leaseKey) === 'browser';
     if (cmd.frameIndex != null) {
@@ -2043,6 +2079,39 @@ async function handleScreenshot(cmd: Command, leaseKey: string): Promise<Result>
   }
 }
 
+async function handleVisual(cmd: Command, leaseKey: string): Promise<Result> {
+  const tabId = await resolveTabId(await resolveCommandTabId(cmd), leaseKey, undefined, true);
+  try {
+    let data: unknown;
+    switch (cmd.visualOp) {
+      case 'capture':
+        data = await visual.captureVisibleTab(tabId);
+        break;
+      case 'hover':
+      case 'click':
+        if (!Number.isFinite(cmd.visualX) || !Number.isFinite(cmd.visualY)) {
+          return { id: cmd.id, ok: false, errorCode: 'invalid_visual_point', error: 'Visual point requires finite X and Y.' };
+        }
+        data = await visual.pointAction(tabId, cmd.visualOp, cmd.visualX!, cmd.visualY!);
+        break;
+      case 'focus':
+        data = await visual.focusedControl(tabId);
+        break;
+      case 'type':
+        if (typeof cmd.text !== 'string') {
+          return { id: cmd.id, ok: false, errorCode: 'invalid_visual_text', error: 'Visual type requires text.' };
+        }
+        data = await visual.typeFocusedText(tabId, cmd.text);
+        break;
+      default:
+        return { id: cmd.id, ok: false, errorCode: 'invalid_visual_operation', error: 'Unknown visual operation.' };
+    }
+    return pageScopedResult(cmd.id, tabId, data);
+  } catch (err) {
+    return errorResult(cmd.id, err);
+  }
+}
+
 /** CDP methods permitted via the 'cdp' passthrough action. */
 const CDP_ALLOWLIST = new Set([
   // Agent DOM context
@@ -2071,6 +2140,13 @@ const CDP_ALLOWLIST = new Set([
   // Emulation (used by screenshot full-page)
   'Emulation.setDeviceMetricsOverride',
   'Emulation.clearDeviceMetricsOverride',
+  // Virtual authenticator scoped to the lease tab (passkey sign-in without OS UI)
+  'WebAuthn.enable',
+  'WebAuthn.disable',
+  'WebAuthn.addVirtualAuthenticator',
+  'WebAuthn.removeVirtualAuthenticator',
+  'WebAuthn.addCredential',
+  'WebAuthn.getCredentials',
 ]);
 
 async function handleCdp(cmd: Command, leaseKey: string): Promise<Result> {
@@ -2079,7 +2155,7 @@ async function handleCdp(cmd: Command, leaseKey: string): Promise<Result> {
     return { id: cmd.id, ok: false, error: `CDP method not permitted: ${cmd.cdpMethod}` };
   }
   const cmdTabId = await resolveCommandTabId(cmd);
-  const tabId = await resolveTabId(cmdTabId, leaseKey);
+  const tabId = await resolveTabId(cmdTabId, leaseKey, undefined, Boolean(cmd.page));
   try {
     const aggressive = getSurfaceFromKey(leaseKey) === 'browser';
     await executor.ensureAttached(tabId, aggressive);
@@ -2235,6 +2311,73 @@ async function windowClosedBefore(windowId: number, deadline: number): Promise<b
     if (Date.now() >= deadline) return false;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
+}
+
+// ─── Self-reload ─────────────────────────────────────────────────────
+// PROBLEM: an unpacked extension runs new code only after a reload, and agents
+// cannot click the browser's extensions page, so every extension change used to
+// wait for a human.
+// DESIGN: `reload-extension` reloads from disk on request. It refuses while a
+// command runs, or while an interactive browser session holds a tab (unless
+// forced), because a reload drops both. A reload also forgets opencli's windows
+// (storage.session is cleared, see StoredRegistry), so it closes them first
+// instead of leaving orphans. It answers before reloading so the CLI gets the reply.
+
+let selfReloadDelayMs = 300;
+
+function currentBuildId(): string {
+  return typeof __OPENCLI_BUILD_ID__ === 'string' ? __OPENCLI_BUILD_ID__ : 'unbuilt';
+}
+
+function liveSessionSummary(): { running: number; interactive: string[] } {
+  let running = 0;
+  for (const count of activeCommandCounts.values()) running += count;
+  const interactive = [...automationSessions.keys()]
+    .filter((key) => getSurfaceFromKey(key) === 'browser')
+    .map((key) => getSessionFromKey(key));
+  return { running, interactive };
+}
+
+function handleExtensionInfo(cmd: Command): Result {
+  const live = liveSessionSummary();
+  return {
+    id: cmd.id,
+    ok: true,
+    data: {
+      version: chrome.runtime.getManifest().version,
+      buildId: currentBuildId(),
+      contextId: currentContextId,
+      runningCommands: live.running,
+      interactiveSessions: live.interactive,
+    },
+  };
+}
+
+async function handleReloadExtension(cmd: Command): Promise<Result> {
+  const live = liveSessionSummary();
+  if (live.running > 0) {
+    return {
+      id: cmd.id,
+      ok: false,
+      errorCode: 'extension_busy',
+      error: `${live.running} opencli command(s) still running in this browser profile`,
+      errorHint: 'Wait for them to finish, then reload again.',
+    };
+  }
+  if (live.interactive.length > 0 && cmd.force !== true) {
+    return {
+      id: cmd.id,
+      ok: false,
+      errorCode: 'extension_busy',
+      error: `Interactive browser session(s) still hold a tab: ${live.interactive.join(', ')}`,
+      errorHint: 'A reload drops their tabs. Finish those sessions first, or pass --force.',
+    };
+  }
+  const closed = await handleCloseOwnedWindows(cmd);
+  const buildId = currentBuildId();
+  console.log(`[opencli] Reloading extension on request (running build ${buildId})`);
+  setTimeout(() => chrome.runtime.reload(), selfReloadDelayMs);
+  return { id: cmd.id, ok: true, data: { reloading: true, buildId, windows: closed.ok ? closed.data : null } };
 }
 
 function isOwnedInteractiveTab(tab: chrome.tabs.Tab, windowId: number): boolean {
@@ -2528,6 +2671,7 @@ export const __test__ = {
     ws = null;
   },
   setOwnedWindowCloseTimeoutMs: (ms: number) => { ownedWindowCloseTimeoutMs = ms; },
+  setSelfReloadDelayMs: (ms: number) => { selfReloadDelayMs = ms; },
   setActiveCommandCount: (leaseKey: string, count: number) => {
     if (count > 0) activeCommandCounts.set(leaseKey, count);
     else activeCommandCounts.delete(leaseKey);

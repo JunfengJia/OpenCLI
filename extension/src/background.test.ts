@@ -430,6 +430,51 @@ describe('background tab isolation', () => {
     );
   });
 
+  it('does not reroute an explicit CDP target when its tab is gone', async () => {
+    const { chrome } = createChromeMock();
+    chrome.debugger.sendCommand = vi.fn(async () => ({}));
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
+    const get = chrome.tabs.get;
+    chrome.tabs.get = vi.fn(async (tabId: number) => {
+      if (tabId === 1) throw new Error('No tab with id: 1');
+      return get(tabId);
+    });
+
+    const result = await mod.__test__.handleCommand({
+      id: 'exact-gone', action: 'cdp', session: 'twitter', surface: 'adapter',
+      page: 'target-1', cdpMethod: 'Input.dispatchMouseEvent', cdpParams: { type: 'mousePressed', x: 10, y: 10 },
+    });
+
+    expect(result).toMatchObject({ ok: false, errorCode: 'target_tab_gone' });
+    expect(chrome.debugger.sendCommand).not.toHaveBeenCalled();
+    expect(chrome.tabs.create).not.toHaveBeenCalled();
+  });
+
+  it('does not reroute an explicit CDP target that becomes non-debuggable or leaves its session', async () => {
+    const { chrome, tabs } = createChromeMock();
+    chrome.debugger.sendCommand = vi.fn(async () => ({}));
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
+    tabs[0].url = 'chrome://extensions';
+
+    const nonDebuggable = await mod.__test__.handleCommand({
+      id: 'exact-chrome', action: 'cdp', session: 'twitter', surface: 'adapter',
+      page: 'target-1', cdpMethod: 'Input.dispatchMouseEvent', cdpParams: { type: 'mousePressed', x: 10, y: 10 },
+    });
+    const outsideSession = await mod.__test__.handleCommand({
+      id: 'exact-other', action: 'cdp', session: 'twitter', surface: 'adapter',
+      page: 'target-2', cdpMethod: 'Input.dispatchMouseEvent', cdpParams: { type: 'mousePressed', x: 10, y: 10 },
+    });
+
+    expect(nonDebuggable).toMatchObject({ ok: false, errorCode: 'target_tab_not_debuggable' });
+    expect(outsideSession).toMatchObject({ ok: false, errorCode: 'target_tab_mismatch' });
+    expect(chrome.debugger.sendCommand).not.toHaveBeenCalled();
+    expect(chrome.tabs.create).not.toHaveBeenCalled();
+  });
+
   it('routes frame-target CDP passthrough calls through the iframe target', async () => {
     const { chrome } = createChromeMock();
     chrome.debugger.sendCommand = vi.fn(async (_target: unknown, method: string, params?: Record<string, unknown>) => {
@@ -2977,5 +3022,123 @@ describe('background tab isolation', () => {
     expect((result.data as any).kept).toEqual([]);
     expect((result.data as any).closed).toEqual([expect.objectContaining({ role: 'automation', windowId: 1 })]);
     expect(mod.__test__.getSession(adapterKey('first'))).toBeNull();
+  });
+
+  it('reports its build and live sessions for extension-info', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    mod.__test__.setAutomationWindowId(browserKey('work'), 1);
+    mod.__test__.setActiveCommandCount(adapterKey('example'), 2);
+
+    const result = await mod.__test__.handleCommand({ id: 'info', action: 'extension-info' });
+
+    expect(result).toEqual(expect.objectContaining({ id: 'info', ok: true }));
+    // Unbundled test code has no build stamp.
+    expect(result.data).toEqual(expect.objectContaining({
+      version: 'test-version',
+      buildId: 'unbuilt',
+      runningCommands: 2,
+      interactiveSessions: ['work'],
+    }));
+  });
+
+  it('refuses to reload while a command is still running', async () => {
+    const { chrome } = createChromeMock();
+    const reload = vi.fn();
+    (chrome.runtime as any).reload = reload;
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    mod.__test__.setSelfReloadDelayMs(0);
+    mod.__test__.setActiveCommandCount(adapterKey('example'), 1);
+
+    const result = await mod.__test__.handleCommand({ id: 'reload-busy', action: 'reload-extension' });
+
+    expect(result).toEqual(expect.objectContaining({ id: 'reload-busy', ok: false, errorCode: 'extension_busy' }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it('keeps an interactive session unless the reload is forced', async () => {
+    const { chrome } = createChromeMock();
+    const reload = vi.fn();
+    (chrome.runtime as any).reload = reload;
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    mod.__test__.setSelfReloadDelayMs(0);
+    mod.__test__.setAutomationWindowId(browserKey('work'), 1);
+
+    const refused = await mod.__test__.handleCommand({ id: 'reload-held', action: 'reload-extension' });
+    expect(refused).toEqual(expect.objectContaining({ ok: false, errorCode: 'extension_busy' }));
+    expect(refused.error).toContain('work');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(reload).not.toHaveBeenCalled();
+
+    const forced = await mod.__test__.handleCommand({ id: 'reload-forced', action: 'reload-extension', force: true });
+    expect(forced).toEqual(expect.objectContaining({ ok: true }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  it('closes its own windows and answers before it reloads itself', async () => {
+    const { chrome, tabs } = createChromeMock();
+    const closedWindows = new Set<number>();
+    chrome.windows.get.mockImplementation(async (windowId: number) => {
+      if (closedWindows.has(windowId)) throw new Error(`No window with id: ${windowId}.`);
+      return { id: windowId, focused: false };
+    });
+    chrome.windows.remove.mockImplementation(async (windowId: number) => {
+      closedWindows.add(windowId);
+      for (let i = tabs.length - 1; i >= 0; i -= 1) {
+        if (tabs[i].windowId === windowId) tabs.splice(i, 1);
+      }
+    });
+    const reload = vi.fn();
+    (chrome.runtime as any).reload = reload;
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    mod.__test__.setSelfReloadDelayMs(5);
+    await mod.__test__.resolveTabId(undefined, adapterKey('first'));
+
+    const result = await mod.__test__.handleCommand({ id: 'reload', action: 'reload-extension' });
+
+    expect(result).toEqual(expect.objectContaining({ id: 'reload', ok: true }));
+    expect(result.data).toEqual(expect.objectContaining({ reloading: true, buildId: 'unbuilt' }));
+    expect((result.data as any).windows.closed).toEqual([expect.objectContaining({ role: 'automation', windowId: 1 })]);
+    // The answer comes first; the reload runs after it.
+    expect(reload).not.toHaveBeenCalled();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets the WebAuthn virtual authenticator through the guarded CDP passthrough', async () => {
+    // Earlier tests leave a doMock of ./cdp registered; this one needs the real executor.
+    vi.doUnmock('./cdp');
+    const { chrome } = createChromeMock();
+    chrome.debugger.sendCommand = vi.fn(async () => ({ authenticatorId: 'auth-1' }));
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    mod.__test__.setAutomationWindowId(adapterKey('example'), 1);
+
+    const result = await mod.__test__.handleCommand({
+      id: 'webauthn',
+      action: 'cdp',
+      session: 'example',
+      surface: 'adapter',
+      cdpMethod: 'WebAuthn.addVirtualAuthenticator',
+      cdpParams: { options: { protocol: 'ctap2', transport: 'internal' } },
+    });
+
+    expect(result).toEqual(expect.objectContaining({ ok: true }));
+    expect(chrome.debugger.sendCommand).toHaveBeenCalledWith(
+      { tabId: 1 },
+      'WebAuthn.addVirtualAuthenticator',
+      { options: { protocol: 'ctap2', transport: 'internal' } },
+    );
   });
 });

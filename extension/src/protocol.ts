@@ -15,6 +15,8 @@ export type Action =
   | 'close-window'
   | 'close-owned-tab'
   | 'close-owned-windows'
+  | 'extension-info'
+  | 'reload-extension'
   | 'sessions'
   | 'set-file-input'
   | 'insert-text'
@@ -23,7 +25,8 @@ export type Action =
   | 'network-capture-read'
   | 'wait-download'
   | 'cdp'
-  | 'frames';
+  | 'frames'
+  | 'visual';
 
 export interface Command {
   /** Unique request ID */
@@ -66,6 +69,10 @@ export interface Command {
   files?: string[];
   /** CSS selector for file input element (set-file-input action) */
   selector?: string;
+  /** Browser-native visual operation when CDP is blocked by protected extension UI. */
+  visualOp?: 'capture' | 'hover' | 'click' | 'focus' | 'type';
+  visualX?: number;
+  visualY?: number;
   /** Raw text payload for insert-text action */
   text?: string;
   /** URL substring filter pattern for network capture actions */
@@ -82,6 +89,8 @@ export interface Command {
   idleTimeout?: number;
   /** Frame index for cross-frame operations (0-based, from 'frames' action) */
   frameIndex?: number;
+  /** reload-extension: reload even while an interactive browser session holds a tab. */
+  force?: boolean;
   /** Browser profile/context REQUIRED by the CLI (--profile / env). Used by the daemon for strict routing. */
   contextId?: string;
   /**
