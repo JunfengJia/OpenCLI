@@ -65,4 +65,55 @@ describe('gotoResilient', () => {
     const goto = vi.fn().mockRejectedValue(new Error('boom'));
     await expect(gotoResilient({ goto }, 'https://a.test/')).rejects.toThrow('boom');
   });
+
+  // LinkedIn content search, 2026-09-17/18: both navigations rejected, and the adapter read the
+  // fallback tab while it was still about:blank.
+  it('returns from the new-tab fallback only once that tab has landed', async () => {
+    const goto = vi.fn().mockRejectedValue(new Error('Navigation rejected.'));
+    const newTab = vi.fn(async () => 'p2');
+    const setActivePage = vi.fn(async () => {});
+    const evaluate = vi.fn()
+      .mockResolvedValueOnce({ href: 'about:blank', ready: 'complete' })
+      .mockRejectedValueOnce(new Error('Inspected target navigated or closed'))
+      .mockResolvedValueOnce({ session: 's', data: { href: 'https://a.test/', ready: 'loading' } })
+      .mockResolvedValueOnce({ session: 's', data: { href: 'https://a.test/', ready: 'complete' } });
+    await gotoResilient({ goto, newTab, setActivePage, evaluate }, 'https://a.test/');
+    expect(evaluate).toHaveBeenCalledTimes(4);
+  });
+
+  it('fails as a navigation error when the fallback tab never reaches a web page', async () => {
+    for (const href of ['about:blank', 'chrome-error://chromewebdata/']) {
+      vi.useFakeTimers();
+      try {
+        const goto = vi.fn().mockRejectedValue(new Error('Navigation rejected.'));
+        const evaluate = vi.fn(async () => ({ href, ready: 'complete' }));
+        const landing = gotoResilient({ goto, newTab: async () => 'p2', setActivePage: async () => {}, evaluate }, 'https://a.test/');
+        const outcome = expect(landing).rejects.toThrow(`Navigation never landed: https://a.test/ — the fallback tab still showed ${href}`);
+        await vi.advanceTimersByTimeAsync(16_000);
+        await outcome;
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+  });
+
+  it('treats a web page still loading at the bound as landed, as the extension does', async () => {
+    vi.useFakeTimers();
+    try {
+      const goto = vi.fn().mockRejectedValue(new Error('Navigation rejected.'));
+      const evaluate = vi.fn(async () => ({ href: 'https://a.test/slow', ready: 'interactive' }));
+      const landing = gotoResilient({ goto, newTab: async () => 'p2', setActivePage: async () => {}, evaluate }, 'https://a.test/');
+      await vi.advanceTimersByTimeAsync(16_000);
+      await expect(landing).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not poll after a direct navigation succeeds', async () => {
+    const goto = vi.fn(async () => {});
+    const evaluate = vi.fn();
+    await gotoResilient({ goto, evaluate }, 'https://a.test/');
+    expect(evaluate).not.toHaveBeenCalled();
+  });
 });

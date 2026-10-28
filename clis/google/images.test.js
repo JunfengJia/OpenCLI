@@ -240,6 +240,19 @@ describe('google images', () => {
         page.goto
             .mockRejectedValueOnce(new Error('Navigation rejected.'))
             .mockRejectedValueOnce(new Error('Navigation rejected.'));
+        // dc57b82d: the fallback tab starts blank, so gotoResilient polls it before returning. The
+        // first evaluate answers that poll; the rest are the adapter reading the page.
+        page.evaluate = vi.fn()
+            .mockResolvedValueOnce({ href: 'https://www.google.com/search?tbm=isch&q=cats', ready: 'complete' })
+            .mockResolvedValue([[
+                'A tabby cat',
+                'https://cdn.example.com/cat.jpg',
+                'https://encrypted-tbn0.gstatic.com/images?q=tbn:abc',
+                'https://example.com/cats',
+                'example.com',
+                320,
+                240,
+            ]]);
 
         await expect(command.func(page, { keyword: 'cats', limit: 1, resolve: false })).resolves.toHaveLength(1);
 
